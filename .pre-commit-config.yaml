@@ -1,0 +1,33 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0 # Use a recent tag
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-toml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0 # Use a recent tag for ruff
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Add the local hook itself to ensure it runs on this repo
+  # This is more of a sanity check; its real test is in other repos.
+  - repo: local
+    hooks:
+      - id: version-bump
+        name: Local Version Bump (Self-Test)
+        entry: version-bump.py
+        language: python
+        args:
+          # Since this repo doesn't have a "packages" dir in the conventional sense
+          # for the hook's purpose, we can point it to something non-existent
+          # or a dummy directory if we created one for testing.
+          # For now, let's assume it will gracefully handle no packages found.
+          - "--package-dirs"
+          - "non_existent_packages_dir_for_self_test"
+          # We don't expect a root pyproject.toml to be versioned by this hook for itself.
+          # The hook script itself is not a package to be versioned this way. 

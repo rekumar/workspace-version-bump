@@ -1,0 +1,22 @@
+repos:
+  - repo: local # Or path to your repo, e.g., https://github.com/yourusername/your-repo-name
+    rev: v0.1.0 # Replace with the actual tag/commit of your hook
+    hooks:
+      - id: version-bump
+        args:
+          - "--package-dirs"
+          - "packages"
+          # Example: multiple package directories
+          # - "--package-dirs"
+          # - "packages"
+          # - "libs"
+          # - "components"
+          
+          # Example: ignoring specific packages
+          # - "--ignore-packages"
+          # - "utils_package"
+          # - "docs_builder"
+          
+          # Example: specifying a custom path for the root pyproject.toml
+          # - "--root-pyproject-path"
+          # - "my_main_project/pyproject.toml"

@@ -1,0 +1,11 @@
+-   id: version-bump
+    name: UV Workspace Version Bump
+    entry: version-bump.py
+    language: python
+    description: >-
+        Automatically bumps patch versions for changed packages in a UV workspace
+        and the root project if any sub-packages are bumped.
+    args: [] # Users will configure this in their .pre-commit-config.yaml
+    # types: [python] # Not strictly necessary as language is python
+    # require_serial: true # If your hook needs to run in isolation
+    # pass_filenames: false # We get filenames from git diff 
