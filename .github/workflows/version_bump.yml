@@ -1,0 +1,84 @@
+name: Auto Version Bump
+
+on:
+  push:
+    branches:
+      - main # Or your default branch, e.g., master
+
+jobs:
+  bump_versions:
+    runs-on: ubuntu-latest
+    # Prevent a loop if the action itself pushes a commit
+    if: "!contains(github.event.head_commit.message, 'chore: Auto-bump versions')"
+    permissions:
+      contents: write # Allows the action to push commits
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          # Fetch all history so we can diff between any two commits
+          # and so the push operation has the full context.
+          fetch-depth: 0 
+          # You might need to use a PAT here if GITHUB_TOKEN doesn't have sufficient
+          # permissions to trigger other workflows or if you have branch protection rules
+          # that GITHUB_TOKEN can't bypass for pushes.
+          # token: ${{ secrets.YOUR_PAT_IF_NEEDED }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Or your preferred Python version
+
+      - name: Install Dependencies
+        run: pip install tomlkit # tomlkit is the main dependency of the script
+
+      - name: Run Version Bump Script
+        id: version_bump_script
+        run: |
+          echo "Commit before: ${{ github.event.before }}"
+          echo "Commit after: ${{ github.event.after }}"
+          
+          # These are the arguments you might want to customize for your action
+          # For example, you might want different ignore patterns or root project path for the action
+          # compared to your local pre-commit setup.
+          # Ensure any paths are relative to the repository root.
+          ADDITIONAL_ARGS=""
+          # ADDITONAL_ARGS+=" --ignore-dirs "^docs/.*" "^examples/.*""
+          # ADDITONAL_ARGS+=" --root-pyproject-path "./my_project/pyproject.toml""
+          # ADDITONAL_ARGS+=" --dont-bump-root"
+          
+          echo "Running: python version-bump.py --commit-before ${{ github.event.before }} --commit-after ${{ github.event.after }} $ADDITIONAL_ARGS"
+          
+          python version-bump.py \
+            --commit-before ${{ github.event.before }} \
+            --commit-after ${{ github.event.after }} \
+            $ADDITIONAL_ARGS
+        env:
+          # Ensure script output is visible immediately in Actions logs
+          PYTHONUNBUFFERED: "1"
+
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check if the script made any changes that need to be committed
+          # git diff --quiet will exit with 1 if there are changes, 0 if not.
+          if ! git diff --quiet --exit-code; then
+            echo "Changes detected, committing and pushing..."
+            
+            # The script should have already staged the pyproject.toml files it modified.
+            # If not, you might need an explicit 'git add ./**/pyproject.toml' here.
+            # For sanity, let's ensure all modified pyproject.toml are added.
+            # This is a bit of a belt-and-suspenders approach if the script reliably stages.
+            git add ./**/pyproject.toml
+            
+            git status # For debugging, shows what's staged
+            
+            git commit -m "chore: Auto-bump versions"
+            # Use github.ref to push to the same branch the workflow was triggered on (e.g., main)
+            git push origin HEAD:${{ github.ref }} 
+          else
+            echo "No version changes to commit."
+          fi 

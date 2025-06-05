@@ -4,19 +4,28 @@ repos:
     hooks:
       - id: version-bump
         args:
-          - "--package-dirs"
-          - "packages"
-          # Example: multiple package directories
-          # - "--package-dirs"
-          # - "packages"
-          # - "libs"
-          # - "components"
+          # Optional: Specify regex patterns for directory paths (relative to repo root) to ignore.
+          # Directories matching these patterns will not be treated as packages for version bumping.
+          # Example: Ignore all directories under a top-level 'tests' or 'docs' folder.
+          # - "--ignore-dirs"
+          # - "^tests/.*"
+          # - "^docs/.*"
           
-          # Example: ignoring specific packages
-          # - "--ignore-packages"
-          # - "utils_package"
-          # - "docs_builder"
+          # Example: Ignore any directory named 'examples' or '.venv'.
+          # - "--ignore-dirs"
+          # - "examples"
+          # - "\.venv"
+
+          # Example: Ignore directories ending with '_build' or containing 'temp'.
+          # - "--ignore-dirs"
+          # - ".*_build$"
+          # - ".*temp.*"
           
-          # Example: specifying a custom path for the root pyproject.toml
+          # Optional: Specify a custom path for the root pyproject.toml
+          # Default is "pyproject.toml" in the repo root.
           # - "--root-pyproject-path"
           # - "my_main_project/pyproject.toml"
+
+          # Optional: Prevent the root pyproject.toml from being version bumped.
+          # If this flag is present, the root project will not be bumped.
+          # - "--dont-bump-root"

@@ -3,10 +3,12 @@
 Pre-commit hook for automatic version bumping in UV workspace.
 
 This script:
-1. Analyzes git diff to identify changed packages based on specified package directories.
-2. Checks if versions have been manually updated.
-3. Auto-bumps patch version for packages with changes but no version bump, excluding ignored packages.
-4. Bumps root version if any subpackages were bumped, using a configurable root pyproject.toml path.
+1. Scans the repository for all `pyproject.toml` files to identify potential packages.
+2. Filters out the root project and any specified ignored directories.
+3. Analyzes git diff to identify changed packages among the remaining candidates.
+4. Checks if versions have been manually updated.
+5. Auto-bumps patch version for packages with changes but no version bump.
+6. Bumps root version if any subpackages were bumped (unless disabled).
 """
 
 import argparse
@@ -16,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import List, Set, Tuple
 
-import toml
+import tomlkit
 
 
 def run_git_command(cmd: List[str]) -> str:
@@ -32,56 +34,105 @@ def run_git_command(cmd: List[str]) -> str:
         sys.exit(1) # Exit if git command fails, crucial for pre-commit
 
 
-def get_staged_files() -> Set[str]:
-    """Get list of staged files from git."""
-    output = run_git_command(["git", "diff", "--cached", "--name-only"])
+def get_changed_files(
+    commit_before: str | None,
+    commit_after: str | None
+) -> Set[str]:
+    """Get list of changed files from git.
+    If commit_before and commit_after are provided, diffs between them.
+    Otherwise, defaults to staged files (for pre-commit hook usage).
+    """
+    if commit_before and commit_after:
+        # Handle the case for the very first commit to a new branch where `before` is all zeros
+        if commit_before == "0000000000000000000000000000000000000000":
+            print(f"Diffing against empty tree for initial commit/new branch: {commit_after}")
+            # This gets all files in the commit_after (the current commit)
+            # git diff-tree --no-commit-id --name-only -r <commit_sha>
+            output = run_git_command(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit_after])
+        else:
+            print(f"Diffing between commits: {commit_before} and {commit_after}")
+            output = run_git_command(["git", "diff", "--name-only", commit_before, commit_after])
+    else:
+        print("Defaulting to staged files (git diff --cached --name-only)")
+        output = run_git_command(["git", "diff", "--cached", "--name-only"])
     return set(output.split("\n")) if output else set()
 
 
-def get_changed_packages(staged_files: Set[str], package_dirs_str: List[str]) -> Set[Path]:
-    """Identify which package directories have changed files.
+def get_changed_packages(
+    staged_files: Set[str],
+    ignore_dirs_patterns_str: List[str],
+    root_pyproject_path_obj: Path
+) -> Set[Path]:
+    """
+    Identify package directories that have staged changes.
 
-    Assumes that a package is structured as so:
-
-    for `packages_dirs_str: List[str] = ["packages"]`
-
-    packages/
-        my_package/ #will catch this
-            pyproject.toml 
-            ...
-        my_other_package/ #will catch this
-            pyproject.toml
-            ...
-        my_subfolder/
-            my_nested_package/ #will NOT catch this, since its not one level down. add "packages/my_subfolder/my_nested_package" to package_dirs_str to catch this.
-                pyproject.toml
-                ...
-                
+    1. Finds all `pyproject.toml` files in the current working directory.
+    2. Excludes the root `pyproject.toml`'s directory.
+    3. Excludes directories specified in `ignore_dirs_patterns_str`.
+    4. For the remaining, checks if any staged files are within them.
+    Returns a set of relative paths to changed package directories.
     """
     changed_pkgs_set = set()
-    for p_dir_str in package_dirs_str:  # e.g., "packages", "libs"
-        package_group_dir = Path(p_dir_str)
-        if not package_group_dir.is_dir():
-            print(f"⚠️  Configured package directory not found: {package_group_dir}")
+    repo_root = Path.cwd()
+
+    # Resolve root pyproject path for reliable comparison
+    abs_root_package_dir = root_pyproject_path_obj.parent.resolve()
+    
+    # Compile ignore regex patterns
+    compiled_ignore_patterns = []
+    for pattern_str in ignore_dirs_patterns_str: # Renamed from ignore_package_dirs
+        try:
+            compiled_ignore_patterns.append(re.compile(pattern_str))
+        except re.error as e:
+            print(f"⚠️ Invalid regex pattern in --ignore-dirs: '{pattern_str}'. Error: {e}. Skipping this pattern.")
             continue
 
-        for file_path_str in staged_files:
-            try:
-                fp = Path(file_path_str)
-                # Check if fp is relative to package_group_dir and has subdirectories
-                if fp.is_relative_to(package_group_dir) and len(fp.parts) > len(package_group_dir.parts):
-                    # The package name is the first directory inside the package_group_dir
-                    package_sub_dir_name = fp.parts[len(package_group_dir.parts)]
-                    actual_package_path = package_group_dir / package_sub_dir_name
+    for pyproject_file in repo_root.rglob("pyproject.toml"):
+        package_dir_abs = pyproject_file.parent.resolve()
 
-                    if actual_package_path.is_dir() and (actual_package_path / "pyproject.toml").exists():
-                        changed_pkgs_set.add(actual_package_path)
-            except ValueError:
-                # Path.is_relative_to raises ValueError if not relative
+        # Skip if it's the root project's directory
+        if package_dir_abs == abs_root_package_dir:
+            continue
+
+        # Convert to relative path for regex matching and reporting
+        try:
+            package_dir_rel = package_dir_abs.relative_to(repo_root)
+        except ValueError:
+            print(f"⚠️ Could not make path relative for {package_dir_abs}, skipping.")
+            continue
+
+        # Skip if it matches any ignore regex pattern
+        ignored_by_regex = False
+        for pattern in compiled_ignore_patterns:
+            # Use search to find the pattern anywhere in the relative path string
+            # Paths are converted to strings and use forward slashes on all platforms by Path objects
+            if pattern.search(str(package_dir_rel).replace('\\', '/')):
+                print(f"🚫 Ignoring directory '{package_dir_rel}' as it matches ignore pattern: '{pattern.pattern}'.")
+                ignored_by_regex = True
+                break
+        if ignored_by_regex:
+            continue
+        
+        # Check if any staged file is within this package directory
+        for staged_file_str in staged_files:
+            staged_file_path = Path(staged_file_str)
+            # Ensure staged_file_path is relative to repo_root for is_relative_to to work as expected
+            # Path.is_relative_to needs both paths to be absolute or both relative to the same root.
+            # Staged files from git are usually relative to repo root.
+            try:
+                # Path.is_relative_to() works correctly if staged_file_path is relative
+                # and package_dir_abs is absolute, by making staged_file_path absolute first.
+                # However, to be explicit and safe with various path states:
+                if staged_file_path.resolve().is_relative_to(package_dir_abs):
+                    changed_pkgs_set.add(package_dir_rel)
+                    # print(f"Found change in {package_dir_rel} due to {staged_file_str}") # Debug
+                    break  # Found a change in this package, move to next pyproject.toml
+            except ValueError: # Not relative
                 continue
-            except Exception as e:
-                print(f"Error processing file {file_path_str} in {package_group_dir}: {e}")
+            except Exception as e: # other potential errors like file not existing if resolve fails
+                print(f"Error checking staged file {staged_file_str} against {package_dir_abs}: {e}")
                 continue
+                
     return changed_pkgs_set
 
 
@@ -104,57 +155,72 @@ def increment_patch_version(version_str: str) -> str:
 
 
 def get_version_from_pyproject(pyproject_path: Path) -> str:
-    """Extract version from pyproject.toml."""
+    """Extract version from pyproject.toml using tomlkit."""
     try:
         with open(pyproject_path, "r") as f:
-            data = toml.load(f)
-        project_data = data.get("project") or data.get("tool", {}).get("poetry") # Handle poetry projects too
+            content = f.read()
+        data = tomlkit.parse(content)
+        
+        project_data = data.get("project")
         if project_data and "version" in project_data:
-            return project_data["version"]
-        else:
-            print(f"Warning: Could not find version in {pyproject_path} under [project] or [tool.poetry]")
-            return None
-    except (FileNotFoundError, toml.TomlDecodeError) as e:
-        print(f"Error reading version from {pyproject_path}: {e}")
+            return str(project_data["version"]) # Ensure it's a string
+        
+        tool_data = data.get("tool")
+        if tool_data and "poetry" in tool_data and "version" in tool_data["poetry"]:
+            return str(tool_data["poetry"]["version"]) # Ensure it's a string
+            
+        print(f"Warning: Could not find version in {pyproject_path} under [project] or [tool.poetry]")
+        return None
+    except (FileNotFoundError, tomlkit.exceptions.ParseError) as e: # Updated exception type
+        print(f"Error reading or parsing version from {pyproject_path}: {e}")
         return None
 
 
 def set_version_in_pyproject(pyproject_path: Path, new_version: str) -> bool:
-    """Update version in pyproject.toml."""
+    """Update version in pyproject.toml using tomlkit to preserve formatting."""
     try:
         with open(pyproject_path, "r") as f:
             content = f.read()
-            lines = content.splitlines()
+        
+        data = tomlkit.parse(content)
+        updated = False
 
-        # Try to find version under [project] or [tool.poetry]
-        # More robust than regex for TOML structure but regex for line replacement
-        # version_key_pattern = r'^\s*version\s*=\s*["\'](.*)["\']' # Original
-        # More specific for project.version or tool.poetry.version
-        
-        # We will use regex to replace the version to preserve formatting as initially designed
-        # This is simpler and less prone to TOML parsing/writing issues for just this one line.
-        pattern = r'(version\s*=\s*["\'])([^"\']+)(["\'])'
-        
-        # Check if version exists first
-        found_version_line = False
-        for line in lines:
-            if re.match(pattern, line.strip()): # Check if line matches pattern for version
-                found_version_line = True
-                break
-        
-        if not found_version_line:
-            print(f"Error: 'version' field not found or not in expected format in {pyproject_path}")
+        # Try to update [project.version]
+        if "project" in data and "version" in data["project"]:
+            # Ensure we are replacing a string item, not creating a new table if it was malformed
+            if isinstance(data["project"]["version"], str) or isinstance(data["project"]["version"], tomlkit.items.String):
+                current_version = str(data["project"]["version"])
+                if current_version != new_version:
+                    data["project"]["version"] = new_version
+                    updated = True
+            else:
+                print(f"Warning: 'project.version' in {pyproject_path} is not a string. Skipping update here.")
+
+        # Else, try to update [tool.poetry.version] (only if project.version wasn't found/updated)
+        elif "tool" in data and "poetry" in data["tool"] and "version" in data["tool"]["poetry"]:
+             # Ensure we are replacing a string item
+            if isinstance(data["tool"]["poetry"]["version"], str) or isinstance(data["tool"]["poetry"]["version"], tomlkit.items.String):
+                current_version = str(data["tool"]["poetry"]["version"])
+                if current_version != new_version:
+                    data["tool"]["poetry"]["version"] = new_version
+                    updated = True
+            else:
+                print(f"Warning: 'tool.poetry.version' in {pyproject_path} is not a string. Skipping update here.")
+        else:
+            print(f"Error: 'version' field not found under [project] or [tool.poetry] in {pyproject_path}. Cannot update.")
             return False
 
-        new_content = re.sub(pattern, f"\\g<1>{new_version}\\g<3>", content, count=1)
-
-
-        if new_content != content:
+        if updated:
             with open(pyproject_path, "w") as f:
-                f.write(new_content)
-        return True
-    except Exception as e:
-        print(f"Error updating version in {pyproject_path}: {e}")
+                f.write(tomlkit.dumps(data))
+            return True
+        return False # No update was made (e.g. version was already the new_version)
+
+    except (FileNotFoundError, tomlkit.exceptions.ParseError) as e: # Updated exception type
+        print(f"Error reading, parsing, or writing {pyproject_path}: {e}")
+        return False
+    except Exception as e: # Catch other potential errors
+        print(f"An unexpected error occurred while setting version in {pyproject_path}: {e}")
         return False
 
 
@@ -192,16 +258,10 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="UV Workspace Version Bump Pre-commit Hook")
     parser.add_argument(
-        "--package-dirs",
-        nargs="+",
-        default=["packages"],
-        help="Directories containing packages (e.g., packages libs). Default: ['packages']",
-    )
-    parser.add_argument(
-        "--ignore-packages",
+        "--ignore-dirs", # Renamed from --ignore-package-dirs
         nargs="+",
         default=[],
-        help="List of package names (directory names) to ignore. Default: []",
+        help="List of regex patterns for directory paths to ignore (e.g., 'tests/fixtures', '_build/'). Default: []",
     )
     parser.add_argument(
         "--root-pyproject-path",
@@ -213,119 +273,88 @@ def main() -> int:
         action="store_true",
         help="Whether to skip version bumps in the root pyproject.toml. Default: False",
     )
+    parser.add_argument(
+        "--commit-before",
+        type=str,
+        default=None,
+        help="The commit SHA before changes (for GitHub Action context)."
+    )
+    parser.add_argument(
+        "--commit-after",
+        type=str,
+        default=None,
+        help="The commit SHA after changes (for GitHub Action context)."
+    )
     args = parser.parse_args()
+
+    root_pyproject_path_obj = Path(args.root_pyproject_path)
+    if not root_pyproject_path_obj.exists():
+        print(f"❌ Root pyproject.toml not found at {args.root_pyproject_path}. Exiting.")
+        return 1
 
 
     # Get staged files and identify changed packages
-    staged_files = get_staged_files()
-    if not staged_files:
-        print("No staged files found.")
+    changed_file_paths = get_changed_files(args.commit_before, args.commit_after)
+
+    if not changed_file_paths:
+        print("No changed files found.")
         return 0
 
-    changed_packages_all = get_changed_packages(staged_files, args.package_dirs)
+    changed_packages_all = get_changed_packages(changed_file_paths, args.ignore_dirs, root_pyproject_path_obj)
     if not changed_packages_all:
-        print("No package changes detected in specified package directories.")
+        print("No package changes detected in scanned project directories (after filtering).")
         return 0
         
-    # Filter ignored packages
-    changed_packages = set()
-    for pkg_path in changed_packages_all:
-        pkg_name = pkg_path.name # e.g. "my_package" from Path("packages/my_package")
-        if pkg_name in args.ignore_packages:
-            print(f"🚫 Ignoring package '{pkg_name}' as per --ignore-packages configuration.")
-            continue
-        changed_packages.add(pkg_path)
+    changed_packages = changed_packages_all # Use the direct result
 
     if not changed_packages:
-        print("No package changes detected after filtering ignored packages.")
+        print("No package changes detected after filtering ignored packages.") # This message might be redundant now
         return 0
         
     print(f"📦 Changed packages (after filtering): {', '.join(sorted(str(p) for p in changed_packages))}")
 
-    packages_bumped = []
-    # packages_dir = Path("packages") # No longer needed, package_path is absolute
-
+    packages_bumped = [] # Stores display names of packages handled (bumped or acknowledged manual bump)
+    
     # Check each changed package
-    for package_path in sorted(list(changed_packages)): # Iterate in a defined order
-        package_display_name = str(package_path) # e.g. "packages/my_pkg"
-        pyproject_path = package_path / "pyproject.toml"
+    for package_path_rel in sorted(list(changed_packages)): # Iterate in a defined order
+        package_display_name = str(package_path_rel) 
+        pyproject_path = package_path_rel / "pyproject.toml" # This is now a relative path object
 
-        if not pyproject_path.exists(): # Should not happen if get_changed_packages worked
-            print(f"⚠️  No pyproject.toml found for package: {package_display_name} (at {pyproject_path})")
+        # This check should be redundant if get_changed_packages ensures pyproject.toml exists
+        # but keeping it as a safeguard
+        if not pyproject_path.exists(): 
+            print(f"⚠️  No pyproject.toml found for package: {package_display_name} (at {pyproject_path}) - this should not happen.")
             continue
 
-        # Check if version was manually changed in the diff
         current_version_str = get_version_from_pyproject(pyproject_path)
-        # diff_version_str = get_version_from_diff(pyproject_path) # This was pyproject_path: str before
         diff_version_str = get_version_from_diff(str(pyproject_path))
         
-        # Debug print, can be removed later
-        # print(f"Processing {package_display_name}: current_version='{current_version_str}', diff_version='{diff_version_str}'")
-
         if current_version_str is None:
             print(f"⚠️  Could not read current version for {package_display_name}. Skipping.")
             continue
 
-        # If version in diff is different from current disk version, it means user manually changed it.
-        # However, the original logic compared diff_version with current_version.
-        # The logic was: `if diff_version == current_version:`, means NO manual bump was staged.
-        # This seems counter-intuitive. Let's re-evaluate.
-        # get_version_from_diff gets the version from the *staged* file.
-        # get_version_from_pyproject gets the version from the *working directory* file.
-
-        # Correct logic:
-        # 1. Get version from HEAD (or working dir before our changes)
-        # 2. Get version from Staged (what user intends to commit)
-        # If Staged version > HEAD version, user bumped it.
-        # If Staged version == HEAD version, user did NOT bump it, so we might.
-
-        # The current `get_version_from_pyproject` reads the current (potentially modified by user) working dir.
-        # The current `get_version_from_diff` reads the staged version.
-
-        # Let's simplify: if the staged file (`pyproject.toml`) has a version line changed,
-        # we assume the user handled it. `get_version_from_diff` returns the *new* version from the diff.
-        # `current_version_str` is from the *current state on disk* of pyproject.toml.
-
-        # If `pyproject.toml` is staged, and its version changed:
-        #   `diff_version_str` will be the new version.
-        #   `current_version_str` (from disk) if not staged, is old. If staged and changed, could be new.
-        # This part of the logic is a bit tricky.
-        # The original code's `if diff_version == current_version:` was intended to mean:
-        # "If the version in the staged changes IS THE SAME AS the version currently on disk (ignoring the staged changes),
-        # then the user hasn't manually bumped it in a way that differs from the disk."
-        # This is only true if the pyproject.toml was *not* staged with a version bump.
-
-        # A clearer approach:
-        # 1. Get original version (from HEAD for `pyproject.toml`)
-        original_version_str = run_git_command(["git", "show", f"HEAD:{str(pyproject_path.relative_to(Path.cwd()))}"])
         original_version = None
-        if original_version_str:
-            # Quick parse of version from the raw file content. This is a bit fragile.
-            match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', original_version_str)
-            if match:
-                original_version = match.group(1)
-        
-        staged_version_if_changed = diff_version_str # This is the version if '+version' line exists in diff
+        try:
+            # Construct relative path to pyproject.toml from CWD for git show
+            git_show_path = str(pyproject_path) # Already relative from get_changed_packages
+            original_version_content = run_git_command(["git", "show", f"HEAD:{git_show_path}"])
+            if original_version_content:
+                match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', original_version_content)
+                if match:
+                    original_version = match.group(1)
+        except Exception as e:
+            print(f"Could not get HEAD version for {package_display_name}: {e}")
 
-        # If the pyproject.toml for the package is part of the staged files AND its version line changed...
-        if str(pyproject_path) in staged_files and staged_version_if_changed is not None:
-            # User has staged a version change for this pyproject.toml
-            # We should respect this and not auto-bump, provided it's a valid bump or different.
-            if original_version and staged_version_if_changed != original_version:
-                 print(f"✅ Version for {package_display_name} was manually changed and staged: {original_version} → {staged_version_if_changed}. Skipping auto-bump.")
-                 packages_bumped.append(package_display_name) # Count as "handled"
+
+        if str(pyproject_path) in changed_file_paths and diff_version_str is not None:
+            if original_version and diff_version_str != original_version:
+                 print(f"✅ Version for {package_display_name} was manually changed and staged: {original_version} → {diff_version_str}. Skipping auto-bump.")
+                 packages_bumped.append(package_display_name) 
                  continue
-            elif not original_version and staged_version_if_changed: # New file with version
-                 print(f"✅ New package {package_display_name} has staged version: {staged_version_if_changed}. Skipping auto-bump.")
-                 packages_bumped.append(package_display_name) # Count as "handled"
+            elif not original_version and diff_version_str: 
+                 print(f"✅ New package {package_display_name} has staged version: {diff_version_str}. Skipping auto-bump.")
+                 packages_bumped.append(package_display_name)
                  continue
-
-
-        # If we reach here, either:
-        # - pyproject.toml was not staged with a version change.
-        # - pyproject.toml was staged, but version line didn't change (e.g. only other lines changed)
-        # - pyproject.toml was not staged at all (but other files in package were)
-        # So, we proceed to auto-bump based on `current_version_str` (from disk).
 
         new_version = increment_patch_version(current_version_str)
 
@@ -336,52 +365,55 @@ def main() -> int:
                 packages_bumped.append(package_display_name)
             else:
                 print(f"⚠️  Failed to stage {pyproject_path}")
-                # Potentially return 1 here to fail the commit
         else:
             print(f"⚠️  Failed to update version for {package_display_name}")
-            # Potentially return 1 here
 
-    # If any packages were bumped, also bump the root version
-    if packages_bumped and not args.dont_bump_root: # This means either we bumped it, or user bumped it and we acknowledged.
-        root_pyproject_path = Path(args.root_pyproject_path)
-        if root_pyproject_path.exists():
-            current_root_version_str = get_version_from_pyproject(root_pyproject_path)
-            # staged_root_version_str = get_version_from_diff(root_pyproject_path) # Needs str()
-            staged_root_version_str = get_version_from_diff(str(root_pyproject_path))
+    # If any packages were bumped (or acknowledged), also bump the root version
+    if packages_bumped and not args.dont_bump_root:
+        # root_pyproject_path_obj is already defined from args
+        if root_pyproject_path_obj.exists(): # Should exist due to check at start
+            current_root_version_str = get_version_from_pyproject(root_pyproject_path_obj)
+            staged_root_version_str = get_version_from_diff(str(root_pyproject_path_obj))
 
-            # Similar logic for root: if user manually staged a root version change, respect it.
-            original_root_version_str_content = run_git_command(["git", "show", f"HEAD:{str(root_pyproject_path.relative_to(Path.cwd()))}"])
             original_root_version = None
-            if original_root_version_str_content:
-                match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', original_root_version_str_content)
-                if match:
-                    original_root_version = match.group(1)
+            try:
+                # Ensure path is relative to CWD for git show
+                git_show_root_path = str(root_pyproject_path_obj.relative_to(Path.cwd())) if root_pyproject_path_obj.is_absolute() else str(root_pyproject_path_obj)
+                original_root_version_content = run_git_command(["git", "show", f"HEAD:{git_show_root_path}"])
+                if original_root_version_content:
+                    match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', original_root_version_content)
+                    if match:
+                        original_root_version = match.group(1)
+            except Exception as e:
+                 print(f"Could not get HEAD version for root pyproject {args.root_pyproject_path}: {e}")
 
-            if str(root_pyproject_path) in staged_files and staged_root_version_str is not None:
+
+            user_manually_bumped_root = False
+            if str(root_pyproject_path_obj) in changed_file_paths and staged_root_version_str is not None:
                 if original_root_version and staged_root_version_str != original_root_version:
-                    print(f"✅ Root version was manually changed and staged: {original_root_version} → {staged_root_version_str}. Skipping auto-bump for root.")
+                    print(f"✅ Root version ({args.root_pyproject_path}) was manually changed and staged: {original_root_version} → {staged_root_version_str}. Skipping auto-bump for root.")
+                    user_manually_bumped_root = True
                 elif not original_root_version and staged_root_version_str:
-                     print(f"✅ New root pyproject has staged version: {staged_root_version_str}. Skipping auto-bump for root.")
-                # else: proceed to bump if current_root_version_str is valid
+                     print(f"✅ New root pyproject ({args.root_pyproject_path}) has staged version: {staged_root_version_str}. Skipping auto-bump for root.")
+                     user_manually_bumped_root = True
             
-            # If not manually bumped or if no version change was staged for root pyproject.toml
-            # and if current_root_version_str is available
-            elif current_root_version_str:
-                new_root_version = increment_patch_version(current_root_version_str)
-                if set_version_in_pyproject(root_pyproject_path, new_root_version):
-                    print(
-                        f"🔄 Bumped root version ({args.root_pyproject_path}): {current_root_version_str} → {new_root_version}"
-                    )
-                    if not stage_file(str(root_pyproject_path)):
-                        print(f"⚠️  Failed to stage {args.root_pyproject_path}")
-                else:
-                    print(f"⚠️  Failed to update root version at {args.root_pyproject_path}")
-            elif not current_root_version_str:
-                 print(f"⚠️  Could not read current root version from {args.root_pyproject_path}. Skipping root bump.")
+            if not user_manually_bumped_root:
+                if current_root_version_str:
+                    new_root_version = increment_patch_version(current_root_version_str)
+                    if set_version_in_pyproject(root_pyproject_path_obj, new_root_version):
+                        print(
+                            f"🔄 Bumped root version ({args.root_pyproject_path}): {current_root_version_str} → {new_root_version}"
+                        )
+                        if not stage_file(str(root_pyproject_path_obj)):
+                            print(f"⚠️  Failed to stage {args.root_pyproject_path}")
+                    else:
+                        print(f"⚠️  Failed to update root version at {args.root_pyproject_path}")
+                elif not current_root_version_str : # Only print if not manually handled and no current version
+                     print(f"⚠️  Could not read current root version from {args.root_pyproject_path}. Skipping root bump.")
 
 
     if packages_bumped:
-        print(f"✨ Version processing completed. Touched/acknowledged: {', '.join(sorted(packages_bumped))}")
+        print(f"✨ Version processing completed. Touched/acknowledged packages: {', '.join(sorted(packages_bumped))}")
     else:
         print("No version bumps were needed.")
 

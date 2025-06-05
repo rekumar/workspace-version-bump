@@ -14,7 +14,7 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
-  # Add the local hook itself to ensure it runs on this repo
+  # Add the local hook itself to ensure it runs on this repo.
   # This is more of a sanity check; its real test is in other repos.
   - repo: local
     hooks:
@@ -23,11 +23,14 @@ repos:
         entry: version-bump.py
         language: python
         args:
-          # Since this repo doesn't have a "packages" dir in the conventional sense
-          # for the hook's purpose, we can point it to something non-existent
-          # or a dummy directory if we created one for testing.
-          # For now, let's assume it will gracefully handle no packages found.
-          - "--package-dirs"
-          - "non_existent_packages_dir_for_self_test"
-          # We don't expect a root pyproject.toml to be versioned by this hook for itself.
-          # The hook script itself is not a package to be versioned this way. 
+          # For self-testing, we don't want to bump the root pyproject.toml (if it existed and were a package)
+          # This repo doesn't have a conventional package structure for the hook to act upon,
+          # so the main goal is to ensure the script runs without errors.
+          - "--dont-bump-root"
+          # Example of using --ignore-dirs if we had specific test utility dirs with pyproject.toml:
+          # - "--ignore-dirs"
+          # - "^test_utils/.*" # Ignore a potential test_utils directory
+          # No specific --ignore-package-dirs needed here, as the hook should correctly
+          # identify no sub-packages to bump after excluding the root project itself.
+          # If we had a dummy pyproject.toml for testing in e.g. `test_pkg/pyproject.toml`,
+          # we might add `--ignore-package-dirs` for other test utility folders. 
